@@ -35,20 +35,18 @@ Standard chat-based AI plugins disrupt flow by requiring manual copy-pasting, ge
 ### 1. Hover Documentation (`K`)
 Hovering over a borrow-checker error line displays an immediate, pre-cached 2-bullet explanation alongside the verified refactor:
 
-```markdown
-- **Why:** The vector `data` is borrowed as immutable by `first` while `data.push(4)` requires exclusive mutable access.
-- **Fix:** Move the mutation `data.push(4)` before borrowing `&data[0]` to keep the borrow scopes disjoint.
-
-```rust
-fn test_simultaneous_mutable_and_immutable_borrow() {
-    let mut data = vec![1, 2, 3];
-    data.push(4);
-    let first = &data[0];
-    println!("{}", first);
-}
-```
-*`<leader>ca` to apply refactor*
-```
+> - **Why:** The vector `data` is borrowed as immutable by `first` while `data.push(4)` requires exclusive mutable access.
+> - **Fix:** Move the mutation `data.push(4)` before borrowing `&data[0]` to keep the borrow scopes disjoint.
+>
+> ```rust
+> fn test_simultaneous_mutable_and_immutable_borrow() {
+>     let mut data = vec![1, 2, 3];
+>     data.push(4);
+>     let first = &data[0];
+>     println!("{}", first);
+> }
+> ```
+> *`<leader>ca` to apply refactor*
 
 ### 2. Code Actions (`<leader>ca`)
 Pressing code action on the error line opens a verified one-key quickfix:
