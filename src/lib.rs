@@ -534,10 +534,6 @@ pub async fn run_server() {
     if let Ok(home) = std::env::var("HOME") {
         let global_config = std::path::Path::new(&home).join(".config/rust-mentor/.env");
         dotenvy::from_path(global_config).ok();
-
-        let dev_path =
-            std::path::Path::new(&home).join("projects/personal/LearnRust/lsp_server/.env");
-        dotenvy::from_path(dev_path).ok();
     }
 
     let input = tokio::io::stdin();
