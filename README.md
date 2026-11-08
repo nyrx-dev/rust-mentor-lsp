@@ -4,7 +4,6 @@
 
 **A compiler-verified companion Language Server for Rust borrow-checker, ownership, and lifetime diagnostics.**
 
-[![CI](https://github.com/nyrx-dev/rust-mentor-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/nyrx-dev/rust-mentor-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 [![LSP: 3.17 Compliant](https://img.shields.io/badge/LSP-3.17_Compliant-purple.svg)](https://microsoft.github.io/language-server-protocol/)
