@@ -5,6 +5,7 @@ edition = "2024"
 description = "Companion Language Server for Rust borrow-checker and ownership diagnostics with compiler-verified refactors"
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/nyrx-dev/rust-mentor-lsp"
 keywords = ["lsp", "rust", "borrow-checker", "ownership", "developer-tools"]
 categories = ["development-tools"]
 

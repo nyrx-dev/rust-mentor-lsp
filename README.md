@@ -4,12 +4,14 @@
 
 **A compiler-verified companion Language Server for Rust borrow-checker, ownership, and lifetime diagnostics.**
 
-[![CI](https://github.com/rust-mentor/rust-mentor-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-mentor/rust-mentor-lsp/actions)
+[![CI](https://github.com/nyrx-dev/rust-mentor-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/nyrx-dev/rust-mentor-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 [![LSP: 3.17 Compliant](https://img.shields.io/badge/LSP-3.17_Compliant-purple.svg)](https://microsoft.github.io/language-server-protocol/)
 
-*Runs quietly alongside `rust-analyzer` in your editor. Pre-caches ultra-concise explanations in Hover (`K`) and delivers `rustc`-verified code refactors in Code Actions (`<leader>ca`).*
+<p align="center">
+  Runs quietly alongside <code>rust-analyzer</code> in your editor. Pre-caches ultra-concise explanations in Hover (<code>K</code>) and delivers <code>rustc</code>-verified code refactors in Code Actions (<code>&lt;leader&gt;ca</code>).
+</p>
 
 ---
 
@@ -216,7 +218,7 @@ The entire downstream pipeline (AST context extraction, Gemini explanation synth
 Clone this repository and install the binary with Cargo:
 
 ```bash
-git clone https://github.com/rust-mentor/rust-mentor-lsp.git
+git clone https://github.com/nyrx-dev/rust-mentor-lsp.git
 cd rust-mentor-lsp
 cargo install --path .
 ```
