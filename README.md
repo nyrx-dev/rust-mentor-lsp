@@ -32,9 +32,9 @@ Standard chat-based AI plugins disrupt flow by requiring manual copy-pasting, ge
 
 ## 📸 Visual Showcase
 
-![Illustrated Rust Mentor workflow: find an E0382 error, hover for a concise explanation, then apply a checked refactor that borrows instead of moving.](docs/assets/usage-showcase.svg)
+![Rust Mentor LSP workflow in Neovim: hovering over an E0382 error for a concise explanation, then applying a compiler-verified refactor via code action.](docs/assets/usage.gif)
 
-*An illustrated example, not a recording of a live editor session. Keys below use the Neovim configuration in [Editor Setup](#editor-setup).*
+*Recorded from a live Neovim session with Rust Mentor LSP. Keybindings match the [Editor Setup](#editor-setup).*
 
 | Step | You do | Rust Mentor does |
 | :--- | :--- | :--- |

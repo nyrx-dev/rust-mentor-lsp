@@ -20,6 +20,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+*.log
 
 # Python documentation-tool caches
 __pycache__/
