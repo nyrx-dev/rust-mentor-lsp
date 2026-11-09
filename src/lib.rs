@@ -1,6 +1,7 @@
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tower_lsp::{
     Client, LanguageServer,
@@ -38,6 +39,19 @@ pub struct Backend {
     pub line_index: Arc<DashMap<(String, u32), (String, u64)>>,
     pub in_flight: Arc<DashMap<(String, String, u64), ()>>,
     pub semaphore: Arc<Semaphore>,
+    pub versions: Arc<DashMap<String, i32>>,
+    pub revision: Arc<AtomicU64>,
+    state_lock: Arc<Mutex<()>>,
+}
+
+struct InFlightGuard {
+    map: Arc<DashMap<(String, String, u64), ()>>,
+    key: (String, String, u64),
+}
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -69,26 +83,39 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let _state = self.state_lock.lock().unwrap();
         let uri = params.text_document.uri.to_string();
+        self.invalidate_analysis();
+        self.versions
+            .insert(uri.clone(), params.text_document.version);
         self.documents
             .insert(uri.clone(), params.text_document.text);
         self.spawn_background_analysis(uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let _state = self.state_lock.lock().unwrap();
         let uri = params.text_document.uri.to_string();
         if let Some(change) = params.content_changes.into_iter().last() {
+            self.invalidate_analysis();
+            self.versions
+                .insert(uri.clone(), params.text_document.version);
             self.documents.insert(uri, change.text);
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let _state = self.state_lock.lock().unwrap();
         let uri = params.text_document.uri.to_string();
+        self.invalidate_analysis();
+        self.versions.remove(&uri);
         self.documents.remove(&uri);
         self.line_index.retain(|(u, _), _| u != &uri);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let _state = self.state_lock.lock().unwrap();
+        self.invalidate_analysis();
         let uri = params.text_document.uri.to_string();
         if let Some(text) = params.text {
             self.documents.insert(uri.clone(), text);
@@ -122,159 +149,118 @@ impl LanguageServer for Backend {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        let mut actions = Vec::new();
-        let mut seen_codes = HashSet::new();
         let uri_url = params.text_document.uri;
         let uri = uri_url.to_string();
-
+        let (revision, version) = {
+            let _state = self.state_lock.lock().unwrap();
+            (
+                self.revision.load(Ordering::SeqCst),
+                self.versions.get(&uri).map(|v| *v),
+            )
+        };
+        let mut requested = Vec::new();
+        let mut seen = HashSet::new();
         for diag in params.context.diagnostics {
-            let error_code = match &diag.code {
+            let code = match &diag.code {
                 Some(NumberOrString::String(s)) => s.clone(),
                 Some(NumberOrString::Number(n)) => n.to_string(),
                 None => continue,
             };
-
-            if !filter::is_candidate_error_code(&error_code)
-                || !seen_codes.insert(error_code.clone())
-            {
-                continue;
-            }
-
             let line = diag.range.start.line;
-            let sliced = context::slice_context(&uri, line, &error_code, &self.documents);
-
-            if let Some(ref ctx) = sliced
-                && let Some(cached) =
-                    self.cache
-                        .get(&(uri.clone(), error_code.clone(), ctx.context_hash))
-            {
-                self.line_index
-                    .insert((uri.clone(), line), (error_code.clone(), ctx.context_hash));
-
-                if let (Some(fn_range), Some(refactored_code)) =
-                    (ctx.function_range, &cached.verified_refactor)
+            if filter::is_candidate_error_code(&code) && seen.insert((code.clone(), line)) {
+                requested.push((code, line, Some(diag)));
+            }
+        }
+        if requested.is_empty()
+            && let Some(index) = self.line_index.get(&(uri.clone(), params.range.start.line))
+        {
+            requested.push((index.value().0.clone(), params.range.start.line, None));
+        }
+        let mut actions = Vec::new();
+        for (code, line, diag) in requested {
+            let Some(ctx) = context::slice_context(&uri, line, &code, &self.documents) else {
+                continue;
+            };
+            let cached = self
+                .cache
+                .get(&(uri.clone(), code.clone(), ctx.context_hash))
+                .map(|entry| entry.value().clone());
+            if let Some(cached) = cached {
+                // Recheck on request: files outside this buffer may have changed on disk.
+                if let (Some(range), Some(raw), Some(version)) =
+                    (ctx.function_range, cached.verified_refactor, version)
+                    && let Some(replacement) =
+                        verifier::verify_context(&uri, &ctx, &raw, self.document_snapshot()).await
                 {
-                    let mut changes = HashMap::new();
-                    changes.insert(
-                        uri_url.clone(),
-                        vec![TextEdit {
-                            range: fn_range,
-                            new_text: refactored_code.clone(),
-                        }],
-                    );
-
+                    use tower_lsp::lsp_types::{
+                        DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier,
+                        TextDocumentEdit,
+                    };
                     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: format!("Apply Verified Rust Mentor Refactor ({})", error_code),
+                        title: format!("Apply Verified Rust Mentor Refactor ({code})"),
                         kind: Some(CodeActionKind::QUICKFIX),
-                        diagnostics: Some(vec![diag.clone()]),
+                        diagnostics: diag.clone().map(|d| vec![d]),
                         edit: Some(WorkspaceEdit {
-                            changes: Some(changes),
+                            document_changes: Some(DocumentChanges::Edits(vec![
+                                TextDocumentEdit {
+                                    text_document: OptionalVersionedTextDocumentIdentifier {
+                                        uri: uri_url.clone(),
+                                        version: Some(version),
+                                    },
+                                    edits: vec![OneOf::Left(TextEdit {
+                                        range,
+                                        new_text: replacement,
+                                    })],
+                                },
+                            ])),
                             ..Default::default()
                         }),
-                        is_preferred: Some(true),
+                        is_preferred: Some(false),
                         ..Default::default()
                     }));
                 }
-
-                let show_title = format!("Show Cached Rust Mentor Explanation ({})", error_code);
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: show_title.clone(),
+                    title: format!("Show Cached Rust Mentor Explanation ({code})"),
                     kind: Some(CodeActionKind::QUICKFIX),
-                    diagnostics: Some(vec![diag]),
+                    diagnostics: diag.map(|d| vec![d]),
                     command: Some(Command {
-                        title: show_title,
-                        command: "rust_mentor.show_cached".to_string(),
+                        title: "Show explanation".into(),
+                        command: "rust_mentor.show_cached".into(),
                         arguments: None,
                     }),
                     ..Default::default()
                 }));
-                continue;
-            }
-
-            let action_title = format!("Explain error {} with Rust Mentor", error_code);
-
-            let full_message = diag
-                .data
-                .as_ref()
-                .and_then(|d| d.get("rendered"))
-                .and_then(|r| r.as_str())
-                .unwrap_or(&diag.message)
-                .to_string();
-
-            let cmd = Command {
-                title: action_title.clone(),
-                command: "rust_mentor.explain".to_string(),
-                arguments: Some(vec![
-                    serde_json::Value::String(uri.clone()),
-                    serde_json::Value::Number(serde_json::Number::from(line)),
-                    serde_json::Value::String(error_code),
-                    serde_json::Value::String(full_message),
-                ]),
-            };
-
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: action_title,
-                kind: Some(CodeActionKind::QUICKFIX),
-                diagnostics: Some(vec![diag]),
-                command: Some(cmd),
-                ..Default::default()
-            }));
-        }
-
-        if actions.is_empty() {
-            let cursor_line = params.range.start.line;
-            if let Some(index_ref) = self.line_index.get(&(uri.clone(), cursor_line)) {
-                let (error_code, hash) = index_ref.value().clone();
-                if let Some(cached) = self.cache.get(&(uri.clone(), error_code.clone(), hash))
-                    && let Some(ctx) =
-                        context::slice_context(&uri, cursor_line, &error_code, &self.documents)
-                    && ctx.context_hash == hash
-                {
-                    if let (Some(fn_range), Some(refactored_code)) =
-                        (ctx.function_range, &cached.verified_refactor)
-                    {
-                        let mut changes = HashMap::new();
-                        changes.insert(
-                            uri_url.clone(),
-                            vec![TextEdit {
-                                range: fn_range,
-                                new_text: refactored_code.clone(),
-                            }],
-                        );
-
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Apply Verified Rust Mentor Refactor ({})", error_code),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..Default::default()
-                            }),
-                            is_preferred: Some(true),
-                            ..Default::default()
-                        }));
-                    }
-
-                    let show_title =
-                        format!("Show Cached Rust Mentor Explanation ({})", error_code);
-                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: show_title.clone(),
-                        kind: Some(CodeActionKind::QUICKFIX),
-                        command: Some(Command {
-                            title: show_title,
-                            command: "rust_mentor.show_cached".to_string(),
-                            arguments: None,
-                        }),
-                        ..Default::default()
-                    }));
-                }
+            } else if let Some(diag) = diag {
+                let message = diag
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("rendered"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or(&diag.message)
+                    .to_string();
+                let title = format!("Explain error {code} with Rust Mentor");
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: title.clone(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diag]),
+                    command: Some(Command {
+                        title,
+                        command: "rust_mentor.explain".into(),
+                        arguments: Some(vec![
+                            uri.clone().into(),
+                            line.into(),
+                            code.into(),
+                            message.into(),
+                        ]),
+                    }),
+                    ..Default::default()
+                }));
             }
         }
-
-        if actions.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(actions))
+        if self.revision.load(Ordering::SeqCst) != revision {
+            return Ok(None);
         }
+        Ok((!actions.is_empty()).then_some(actions))
     }
 
     async fn execute_command(
@@ -399,6 +385,20 @@ fn build_hover(explanation: &str, verified_refactor: Option<&str>) -> Hover {
 }
 
 impl Backend {
+    fn invalidate_analysis(&self) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        self.cache.clear();
+        self.line_index.clear();
+    }
+
+    fn document_snapshot(&self) -> Vec<(String, String)> {
+        let _state = self.state_lock.lock().unwrap();
+        self.documents
+            .iter()
+            .map(|d| (d.key().clone(), d.value().clone()))
+            .collect()
+    }
+
     pub fn new(client: Client) -> Self {
         let jev = jev::AsyncTypeSafeClient::from_env().ok();
         let gemini = gemini::GeminiClient::from_env().ok();
@@ -412,6 +412,9 @@ impl Backend {
             line_index: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
             semaphore: Arc::new(Semaphore::new(2)),
+            versions: Arc::new(DashMap::new()),
+            revision: Arc::new(AtomicU64::new(0)),
+            state_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -420,11 +423,13 @@ impl Backend {
             return;
         }
         let backend = self.clone();
+        let revision = self.revision.load(Ordering::SeqCst);
         tokio::spawn(async move {
             let errors = verifier::discover_file_errors(&uri).await;
-            if !errors.is_empty() {
-                backend.line_index.retain(|(u, _), _| u != &uri);
+            if backend.revision.load(Ordering::SeqCst) != revision {
+                return;
             }
+            backend.line_index.retain(|(u, _), _| u != &uri);
             for err in errors {
                 let b = backend.clone();
                 let u = uri.clone();
@@ -446,25 +451,40 @@ impl Backend {
         let Some(gemini) = &self.gemini else {
             return false;
         };
-        let Some(sliced) = context::slice_context(uri, line, error_code, &self.documents) else {
-            return false;
+        let (revision, sliced, key) = {
+            let _state = self.state_lock.lock().unwrap();
+            let revision = self.revision.load(Ordering::SeqCst);
+            let Some(sliced) = context::slice_context(uri, line, error_code, &self.documents)
+            else {
+                return false;
+            };
+            if !self.documents.contains_key(uri) {
+                return false;
+            }
+            let key = (uri.to_string(), error_code.to_string(), sliced.context_hash);
+            self.line_index.insert(
+                (uri.to_string(), line),
+                (error_code.to_string(), sliced.context_hash),
+            );
+            if self.cache.contains_key(&key) {
+                return true;
+            }
+            if self.in_flight.insert(key.clone(), ()).is_some() {
+                return false;
+            }
+            (revision, sliced, key)
         };
 
-        let key = (uri.to_string(), error_code.to_string(), sliced.context_hash);
-        self.line_index.insert(
-            (uri.to_string(), line),
-            (error_code.to_string(), sliced.context_hash),
-        );
-
-        if self.cache.contains_key(&key) {
-            return true;
-        }
-
-        if self.in_flight.insert(key.clone(), ()).is_some() {
+        let _flight = InFlightGuard {
+            map: self.in_flight.clone(),
+            key: key.clone(),
+        };
+        let Ok(_permit) = self.semaphore.acquire().await else {
+            return false;
+        };
+        if self.revision.load(Ordering::SeqCst) != revision {
             return false;
         }
-
-        let _permit = self.semaphore.acquire().await.ok();
 
         let should_ask = match &self.jev {
             Some(jev) => filter::should_explain(jev, error_code, message).await,
@@ -472,7 +492,6 @@ impl Backend {
         };
 
         if !should_ask {
-            self.in_flight.remove(&key);
             return false;
         }
 
@@ -485,21 +504,12 @@ impl Backend {
             )
             .await;
 
-        self.in_flight.remove(&key);
-
         let Ok(mentor_resp) = res else {
             return false;
         };
 
         let verified_refactor = if let Some(raw_fn) = &mentor_resp.refactored_function {
-            verifier::verify_refactor(
-                &sliced.file_content,
-                sliced.start_line,
-                sliced.end_line,
-                &sliced.base_indent,
-                raw_fn,
-            )
-            .await
+            verifier::verify_context(uri, &sliced, raw_fn, self.document_snapshot()).await
         } else {
             None
         };
@@ -510,14 +520,23 @@ impl Backend {
             verified_refactor,
         };
 
-        self.cache
-            .retain(|(u, c, h), _| u != uri || c != error_code || *h == sliced.context_hash);
-        self.cache.insert(key, entry);
-        self.line_index.insert(
-            (uri.to_string(), line),
-            (error_code.to_string(), sliced.context_hash),
-        );
+        self.publish_analysis(revision, key, line, entry)
+    }
 
+    fn publish_analysis(
+        &self,
+        revision: u64,
+        key: (String, String, u64),
+        line: u32,
+        entry: CachedAnalysis,
+    ) -> bool {
+        let _state = self.state_lock.lock().unwrap();
+        if self.revision.load(Ordering::SeqCst) != revision {
+            return false;
+        }
+        let (uri, code, hash) = key.clone();
+        self.cache.insert(key, entry);
+        self.line_index.insert((uri, line), (code, hash));
         true
     }
 }
@@ -542,4 +561,63 @@ pub async fn run_server() {
     tower_lsp::Server::new(input, output, socket)
         .serve(service)
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn backend() -> Backend {
+        let (service, _) = tower_lsp::LspService::new(Backend::new);
+        service.inner().clone()
+    }
+    fn entry() -> CachedAnalysis {
+        CachedAnalysis {
+            error_code: "E0382".into(),
+            explanation: "why".into(),
+            verified_refactor: None,
+        }
+    }
+    #[test]
+    fn completing_one_function_does_not_evict_another() {
+        let b = backend();
+        assert!(b.publish_analysis(
+            0,
+            ("file:///tmp/f.rs".into(), "E0382".into(), 1),
+            0,
+            entry()
+        ));
+        assert!(b.publish_analysis(
+            0,
+            ("file:///tmp/f.rs".into(), "E0382".into(), 2),
+            5,
+            entry()
+        ));
+        assert_eq!(b.cache.len(), 2);
+    }
+    #[test]
+    fn stale_background_result_cannot_repopulate_invalidated_cache() {
+        let b = backend();
+        b.invalidate_analysis();
+        assert!(!b.publish_analysis(
+            0,
+            ("file:///tmp/f.rs".into(), "E0382".into(), 1),
+            0,
+            entry()
+        ));
+        assert!(b.cache.is_empty());
+        assert!(b.line_index.is_empty());
+    }
+    #[test]
+    fn cancelled_analysis_releases_in_flight_slot() {
+        let map = Arc::new(DashMap::new());
+        let key = ("file:///tmp/f.rs".into(), "E0382".into(), 1);
+        map.insert(key.clone(), ());
+        {
+            let _guard = InFlightGuard {
+                map: map.clone(),
+                key,
+            };
+        }
+        assert!(map.is_empty());
+    }
 }

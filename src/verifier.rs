@@ -174,35 +174,35 @@ pub async fn verify_refactor(
     base_indent: &str,
     raw_refactor: &str,
 ) -> Option<String> {
-    let stripped = strip_code_fences_and_attrs(raw_refactor);
-    if stripped.trim().is_empty() {
+    let mut context = crate::context::slice_from_str(original_file, start_line_zero, "");
+    let range = context.byte_range.clone()?;
+    if context.start_line != start_line_zero || context.end_line != end_line_zero {
         return None;
     }
-
-    let formatted = format_with_rustfmt(&stripped);
-    let cleaned = normalize_indentation(&formatted, base_indent);
-
-    let rep_lines = cleaned.lines().count().max(1);
-    let fn_start_one = (start_line_zero as usize) + 1;
-    let fn_end_one = fn_start_one + rep_lines - 1;
-
-    let spliced = splice_lines(
-        original_file,
-        start_line_zero as usize,
-        end_line_zero as usize,
-        &cleaned,
-    )?;
-
-    if syn::parse_file(&spliced).is_err() {
+    // This compatibility API describes whole-line edits, so reject inline neighbors.
+    if !original_file[..range.start]
+        .rsplit('\n')
+        .next()?
+        .trim()
+        .is_empty()
+        || !original_file[range.end..]
+            .split('\n')
+            .next()?
+            .trim()
+            .is_empty()
+    {
         return None;
     }
-
-    let rustc_ok =
-        tokio::task::spawn_blocking(move || check_with_rustc(&spliced, fn_start_one, fn_end_one))
-            .await
-            .unwrap_or(false);
-
-    if rustc_ok { Some(cleaned) } else { None }
+    context.base_indent = base_indent.to_string();
+    let raw = raw_refactor.to_string();
+    tokio::task::spawn_blocking(move || {
+        let (replacement, spliced, probe) = prepare_refactor(&context, &raw)?;
+        (check_with_rustc(&spliced, 0, 0) && confirms_probe(&probe, "rustc"))
+            .then(|| format!("{}{}", context.base_indent, replacement))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn format_with_rustfmt(code: &str) -> String {
@@ -291,94 +291,496 @@ fn normalize_indentation(code: &str, target_base_indent: &str) -> String {
         .join("\n")
 }
 
-fn splice_lines(
-    original: &str,
-    start_zero: usize,
-    end_zero: usize,
-    replacement: &str,
-) -> Option<String> {
-    let lines: Vec<&str> = original.lines().collect();
-    if start_zero > end_zero || end_zero >= lines.len() {
-        return None;
-    }
-
-    let mut out = Vec::new();
-    out.extend_from_slice(&lines[..start_zero]);
-    for rep_line in replacement.lines() {
-        out.push(rep_line);
-    }
-    if end_zero + 1 < lines.len() {
-        out.extend_from_slice(&lines[(end_zero + 1)..]);
-    }
-
-    Some(out.join("\n"))
+fn check_with_rustc(source: &str, _fn_start_one: usize, _fn_end_one: usize) -> bool {
+    check_with_compiler(source, "rustc")
 }
 
-fn check_with_rustc(source: &str, fn_start_one: usize, fn_end_one: usize) -> bool {
+fn run_compiler(source: &str, compiler: &str, test: bool) -> Option<std::process::Output> {
     let rmeta_path = next_temp_rmeta_path("verify");
-    let Ok(mut child) = Command::new("rustc")
-        .args([
-            "--edition=2024",
-            "--crate-type=lib",
-            "--emit=metadata",
-            "-o",
-            &rmeta_path,
-            "--error-format=json",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    else {
-        return true;
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(source.as_bytes());
+    let mut command = Command::new(compiler);
+    command.args([
+        "--edition=2024",
+        "--crate-type=lib",
+        "--emit=metadata",
+        "-o",
+        &rmeta_path,
+        "--error-format=json",
+        "-",
+    ]);
+    if test {
+        command.arg("--test");
     }
-
-    let Ok(output) = child.wait_with_output() else {
-        let _ = std::fs::remove_file(&rmeta_path);
-        return true;
-    };
+    let result = (|| {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+        let wrote = child.stdin.take()?.write_all(source.as_bytes()).is_ok();
+        let output = child.wait_with_output().ok()?;
+        wrote.then_some(output)
+    })();
     let _ = std::fs::remove_file(&rmeta_path);
+    result
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stderr.lines() {
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if json.get("level").and_then(|l| l.as_str()) != Some("error") {
-            continue;
-        }
+fn check_with_compiler(source: &str, compiler: &str) -> bool {
+    [false, true].into_iter().all(|test| {
+        run_compiler(source, compiler, test).is_some_and(|output| output.status.success())
+    })
+}
 
-        let in_refactored_fn = json
-            .get("spans")
-            .and_then(|s| s.as_array())
-            .is_some_and(|spans| {
-                spans.iter().any(|sp| {
-                    let l_start =
-                        sp.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    let l_end = sp.get("line_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    l_start <= fn_end_one && l_end >= fn_start_one
-                })
-            });
-
-        if !in_refactored_fn {
-            continue;
-        }
-
-        let code = json
-            .get("code")
-            .and_then(|c| c.get("code"))
-            .and_then(|c| c.as_str())
-            .unwrap_or_default();
-
-        if !matches!(code, "E0432" | "E0433" | "E0412" | "E0425" | "E0405") {
+fn confirms_probe(source: &str, compiler: &str) -> bool {
+    let mut active = false;
+    for test in [false, true] {
+        let Some(output) = run_compiler(source, compiler, test) else {
             return false;
+        };
+        active |= !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    return false;
+                };
+                value["level"] == "error" && value["message"] == "rust-mentor-active-function-probe"
+            });
+    }
+    active
+}
+
+/// Verify an exact edit against an isolated copy of the Cargo workspace when available.
+/// A failed or unavailable check never produces an applicable refactor.
+pub async fn verify_context(
+    uri: &str,
+    context: &crate::context::SlicedContext,
+    raw_refactor: &str,
+    documents: Vec<(String, String)>,
+) -> Option<String> {
+    let path = tower_lsp::lsp_types::Url::parse(uri)
+        .ok()?
+        .to_file_path()
+        .ok()?;
+    let context = context.clone();
+    let raw_refactor = raw_refactor.to_string();
+    tokio::task::spawn_blocking(move || {
+        let (replacement, spliced, probe_source) = prepare_refactor(&context, &raw_refactor)?;
+        let ok = if path
+            .ancestors()
+            .skip(1)
+            .any(|p| p.join("Cargo.toml").is_file())
+        {
+            check_project(&path, &spliced, &probe_source, &documents)
+        } else {
+            check_with_rustc(&spliced, 0, 0) && confirms_probe(&probe_source, "rustc")
+        };
+        ok.then_some(replacement)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn prepare_refactor(
+    context: &crate::context::SlicedContext,
+    raw_refactor: &str,
+) -> Option<(String, String, String)> {
+    let range = context.byte_range.clone()?;
+    let stripped = strip_code_fences_and_attrs(raw_refactor);
+    // Accept one function, including methods with a self parameter, never extra items.
+    syn::parse_str::<syn::ImplItemFn>(&stripped).ok()?;
+    let formatted = format_with_rustfmt(&stripped);
+    let normalized = normalize_indentation(&formatted, &context.base_indent);
+    let replacement = normalized.trim_start().to_string();
+    let mut spliced = context.file_content.clone();
+    spliced.replace_range(range.clone(), &replacement);
+    syn::parse_file(&spliced).ok()?;
+    let function = syn::parse_str::<syn::ImplItemFn>(&replacement).ok()?;
+    let mut probe = replacement.clone();
+    probe.insert_str(
+        function.block.brace_token.span.open().byte_range().end,
+        "::core::compile_error!(\"rust-mentor-active-function-probe\");",
+    );
+    let mut probe_source = context.file_content.clone();
+    probe_source.replace_range(range, &probe);
+    Some((replacement, spliced, probe_source))
+}
+
+struct ScratchDir(std::path::PathBuf);
+impl ScratchDir {
+    fn new() -> std::io::Result<Self> {
+        loop {
+            let id = RMETA_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("rust_mentor_{}_{}", std::process::id(), id));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
         }
     }
+}
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
-    true
+fn copy_workspace(source: &Path, destination: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if path == target || name == "target" || name == ".git" {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        // Do not follow links outside the snapshot or risk modifying their targets.
+        if kind.is_symlink() {
+            return Err(std::io::Error::other("symlink in workspace snapshot"));
+        }
+        let dest = destination.join(name);
+        if kind.is_dir() {
+            copy_workspace(&path, &dest, target)?;
+        } else if kind.is_file() {
+            std::fs::copy(path, dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_project(path: &Path, source: &str, probe: &str, documents: &[(String, String)]) -> bool {
+    let check = || -> Option<bool> {
+        let parent = path.parent()?;
+        let metadata = Command::new("cargo")
+            .args(["metadata", "--offline", "--no-deps", "--format-version=1"])
+            .current_dir(parent)
+            .output()
+            .ok()?;
+        if !metadata.status.success() {
+            return None;
+        }
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).ok()?;
+        let root = Path::new(metadata.get("workspace_root")?.as_str()?);
+        let target = Path::new(metadata.get("target_directory")?.as_str()?);
+        let scratch = ScratchDir::new().ok()?;
+        let snapshot = scratch.0.join("workspace");
+        copy_workspace(root, &snapshot, target).ok()?;
+        // Overlay every open buffer so unsaved sibling modules are checked too.
+        for (uri, text) in documents {
+            let file = tower_lsp::lsp_types::Url::parse(uri)
+                .ok()?
+                .to_file_path()
+                .ok()?;
+            if let Ok(relative) = file.strip_prefix(root) {
+                std::fs::write(snapshot.join(relative), text).ok()?;
+            }
+        }
+        let snapshot_file = snapshot.join(path.strip_prefix(root).ok()?);
+        let run = || {
+            Command::new("cargo")
+                .args([
+                    "check",
+                    "--offline",
+                    "--workspace",
+                    "--all-targets",
+                    "--message-format=json",
+                ])
+                .arg("--target-dir")
+                .arg(scratch.0.join("target"))
+                .arg("--manifest-path")
+                .arg(snapshot.join("Cargo.toml"))
+                .current_dir(parent)
+                .output()
+                .ok()
+        };
+        std::fs::write(&snapshot_file, source).ok()?;
+        if !run()?.status.success() {
+            return Some(false);
+        }
+        // Cargo can succeed without compiling an orphan file or a cfg-disabled function.
+        // Prove that the exact function participated in this check, in the same snapshot.
+        std::fs::write(&snapshot_file, probe).ok()?;
+        let output = run()?;
+        let active = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                return false;
+            };
+            value["message"]["level"] == "error"
+                && value["message"]["message"] == "rust-mentor-active-function-probe"
+        });
+        Some(!output.status.success() && active)
+    };
+    check().unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_compiler_is_not_success() {
+        assert!(!confirms_probe(
+            "fn f() {}",
+            "/nonexistent/rust-mentor-rustc"
+        ));
+        assert!(!check_with_compiler(
+            "fn f() {}",
+            "/nonexistent/rust-mentor-rustc"
+        ));
+    }
+
+    #[test]
+    fn rejects_unresolved_symbols() {
+        assert!(!check_with_rustc("fn f() { missing(); }", 1, 1));
+    }
+
+    #[test]
+    fn rejects_broken_callers_outside_replacement() {
+        assert!(!check_with_rustc(
+            "fn f(_: u8) {}\nfn caller() { f(); }",
+            1,
+            1
+        ));
+    }
+
+    #[test]
+    fn checks_test_configuration() {
+        assert!(!check_with_rustc(
+            "#[cfg(test)]\nmod tests { fn f() { missing(); } }",
+            2,
+            2
+        ));
+    }
+
+    #[test]
+    fn accepts_valid_standalone_code() {
+        assert!(check_with_rustc(
+            "fn f() { let s = String::new(); println!(\"{}\", s); }",
+            1,
+            1
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_borrow_error() {
+        let source = "fn f() {}";
+        assert!(
+            verify_refactor(
+                source,
+                0,
+                0,
+                "",
+                "fn f() { let s = String::new(); let t = s; println!(\"{}\", s); }"
+            )
+            .await
+            .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+    use crate::context::slice_from_str;
+
+    fn project(source: &str) -> ScratchDir {
+        let dir = ScratchDir::new().unwrap();
+        std::fs::create_dir(dir.0.join("src")).unwrap();
+        std::fs::write(dir.0.join("Cargo.toml"), "[package]\nname='verification_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n").unwrap();
+        std::fs::write(dir.0.join("src/lib.rs"), source).unwrap();
+        dir
+    }
+
+    async fn verify(
+        dir: &ScratchDir,
+        file: &str,
+        line: u32,
+        fix: &str,
+        buffers: Vec<(String, String)>,
+    ) -> Option<String> {
+        let path = dir.0.join(file).canonicalize().unwrap();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let ctx = slice_from_str(&source, line, "E0382");
+        verify_context(
+            tower_lsp::lsp_types::Url::from_file_path(path)
+                .unwrap()
+                .as_str(),
+            &ctx,
+            fix,
+            buffers,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn verifies_modules_in_project_context_without_editing_original() {
+        let dir = project("mod helper;\npub fn value() -> u8 { helper::value() }\n");
+        std::fs::write(
+            dir.0.join("src/helper.rs"),
+            "pub fn value() -> u8 { missing() }",
+        )
+        .unwrap();
+        assert!(
+            verify(
+                &dir,
+                "src/helper.rs",
+                0,
+                "pub fn value() -> u8 { 42 }",
+                vec![]
+            )
+            .await
+            .is_some()
+        );
+        assert!(
+            std::fs::read_to_string(dir.0.join("src/helper.rs"))
+                .unwrap()
+                .contains("missing()")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_project_caller_regressions() {
+        let dir = project("pub fn value() -> u8 { 42 }\npub fn caller() -> u8 { value() }");
+        assert!(
+            verify(
+                &dir,
+                "src/lib.rs",
+                0,
+                "pub fn value(_: u8) -> u8 { 42 }",
+                vec![]
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn includes_unsaved_sibling_buffers() {
+        let dir = project("mod helper;\npub fn value() -> u8 { helper::value() }");
+        let path = dir.0.join("src/helper.rs");
+        std::fs::write(&path, "pub fn value() -> u8 { 42 }").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(path.canonicalize().unwrap()).unwrap();
+        assert!(
+            verify(
+                &dir,
+                "src/lib.rs",
+                1,
+                "pub fn value() -> u8 { helper::value() }",
+                vec![(
+                    uri.to_string(),
+                    "pub fn value() -> String { String::new() }".into()
+                )]
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_files_not_part_of_a_target() {
+        let dir = project("pub fn value() {}");
+        std::fs::write(dir.0.join("src/orphan.rs"), "pub fn orphan() {}").unwrap();
+        assert!(
+            verify(
+                &dir,
+                "src/orphan.rs",
+                0,
+                "pub fn orphan() { missing(); }",
+                vec![]
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_functions_disabled_by_cfg() {
+        let dir = project("#[cfg(any())]\npub fn value() {}");
+        assert!(
+            verify(
+                &dir,
+                "src/lib.rs",
+                1,
+                "pub fn value() { missing(); }",
+                vec![]
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_local_dependencies_and_default_features() {
+        let dir = project("#[cfg(feature = \"enabled\")]\npub fn value() -> u8 { dep::value() }");
+        std::fs::create_dir_all(dir.0.join("dep/src")).unwrap();
+        std::fs::write(
+            dir.0.join("dep/Cargo.toml"),
+            "[package]\nname='dep'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("dep/src/lib.rs"), "pub fn value() -> u8 { 42 }").unwrap();
+        let manifest = dir.0.join("Cargo.toml");
+        let mut text = std::fs::read_to_string(&manifest).unwrap();
+        text.push_str(
+            "[dependencies]\ndep={path='dep'}\n[features]\ndefault=['enabled']\nenabled=[]\n",
+        );
+        std::fs::write(manifest, text).unwrap();
+        assert!(
+            verify(
+                &dir,
+                "src/lib.rs",
+                1,
+                "pub fn value() -> u8 { dep::value() + 1 }",
+                vec![]
+            )
+            .await
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_edit_preserves_inline_neighbors_and_indentation() {
+        let dir = ScratchDir::new().unwrap();
+        let source = "mod m {\n    fn f() { missing(); } const X: u8 = 1;\n}";
+        let path = dir.0.join("standalone.rs");
+        std::fs::write(&path, source).unwrap();
+        let ctx = slice_from_str(source, 1, "E0425");
+        let uri = tower_lsp::lsp_types::Url::from_file_path(path).unwrap();
+        let replacement = verify_context(uri.as_str(), &ctx, "fn f() { let _ = \"🦀\"; }", vec![])
+            .await
+            .unwrap();
+        let mut result = source.to_string();
+        result.replace_range(ctx.byte_range.unwrap(), &replacement);
+        assert!(result.contains("    fn f()"));
+        assert!(result.contains("} const X: u8 = 1;"));
+        assert!(check_with_rustc(&result, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn rejects_extra_generated_items() {
+        let dir = project("pub fn value() {}");
+        assert!(
+            verify(
+                &dir,
+                "src/lib.rs",
+                0,
+                "pub fn value() {} fn injected() {}",
+                vec![]
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn verifies_test_only_functions() {
+        let dir = project("#[cfg(test)]\nmod tests {\n fn example() { missing(); }\n}");
+        assert!(
+            verify(&dir, "src/lib.rs", 2, "fn example() {}", vec![])
+                .await
+                .is_some()
+        );
+    }
 }

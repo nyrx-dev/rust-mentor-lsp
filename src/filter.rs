@@ -23,7 +23,9 @@ pub fn is_candidate_error_code(code: &str) -> bool {
     }
 
     if let Ok(extra) = std::env::var("RUST_MENTOR_EXTRA_ERROR_CODES") {
-        return extra.split(',').any(|c| c.trim().eq_ignore_ascii_case(code));
+        return extra
+            .split(',')
+            .any(|c| c.trim().eq_ignore_ascii_case(code));
     }
 
     false
